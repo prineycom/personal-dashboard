@@ -152,5 +152,88 @@ def update_goal_progress(slug: str, current_value: float) -> str:
     return json.dumps({"success": True, "slug": slug, "current_value": current_value}, ensure_ascii=False)
 
 
+# ── ЕЖЕДНЕВНИК ──────────────────────────────────────────────
+
+@mcp.tool()
+def get_daily_entry(entry_date: str | None = None) -> str:
+    """Показать дневную запись (morning_review, evening_review, оценка дня). По умолчанию сегодня."""
+    entry_date = entry_date or date.today().isoformat()
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM daily_entries WHERE entry_date = ?", (entry_date,)).fetchone()
+    conn.close()
+    if not row:
+        return json.dumps({"entry_date": entry_date, "exists": False}, ensure_ascii=False)
+    return json.dumps(dict(row), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def save_daily_entry(entry_date: str | None = None,
+                     morning_review: str = "",
+                     evening_review: str = "",
+                     day_score: int = 0,
+                     energy_morning: int = 0,
+                     todo_list: str = "") -> str:
+    """Сохранить дневную запись. entry_date = YYYY-MM-DD (по умолчанию сегодня). todo_list = JSON array строк."""
+    entry_date = entry_date or date.today().isoformat()
+    conn = db()
+    try:
+        conn.execute("""
+            INSERT INTO daily_entries (entry_date, morning_review, evening_review, day_score, energy_morning, todo_list)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(entry_date) DO UPDATE SET
+                morning_review = excluded.morning_review,
+                evening_review = excluded.evening_review,
+                day_score = excluded.day_score,
+                energy_morning = excluded.energy_morning,
+                todo_list = excluded.todo_list,
+                updated_at = CURRENT_TIMESTAMP
+        """, (entry_date, morning_review, evening_review, day_score, energy_morning, todo_list))
+        conn.commit()
+        return json.dumps({"success": True, "entry_date": entry_date}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
+# ── ЗДОРОВЬЕ ──────────────────────────────────────────────
+
+@mcp.tool()
+def get_health_log(entry_date: str | None = None) -> str:
+    """Показать запись здоровья за день (вес, сон, шаги, пульс). По умолчанию сегодня."""
+    entry_date = entry_date or date.today().isoformat()
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM health_daily WHERE entry_date = ?", (entry_date,)).fetchone()
+    conn.close()
+    if not row:
+        return json.dumps({"entry_date": entry_date, "exists": False}, ensure_ascii=False)
+    return json.dumps(dict(row), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def save_health_log(entry_date: str | None = None,
+                    weight: float = 0,
+                    sleep_hours: float = 0,
+                    steps: int = 0,
+                    heart_avg: int = 0) -> str:
+    """Сохранить запись здоровья. entry_date = YYYY-MM-DD (по умолчанию сегодня)."""
+    entry_date = entry_date or date.today().isoformat()
+    conn = db()
+    try:
+        conn.execute("""
+            INSERT INTO health_daily (entry_date, weight, sleep_hours, steps, heart_avg)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(entry_date) DO UPDATE SET
+                weight = excluded.weight,
+                sleep_hours = excluded.sleep_hours,
+                steps = excluded.steps,
+                heart_avg = excluded.heart_avg
+        """, (entry_date, weight, sleep_hours, steps, heart_avg))
+        conn.commit()
+        return json.dumps({"success": True, "entry_date": entry_date}, ensure_ascii=False)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     mcp.run()
