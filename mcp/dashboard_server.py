@@ -195,70 +195,7 @@ def save_daily_entry(entry_date: str | None = None,
         conn.close()
 
 
-# ── ЗАДАЧИ (бэклог) ─────────────────────────────────────────
-
-@mcp.tool()
-def list_tasks(status: str = "active", project_slug: str = "") -> str:
-    """Список задач. status: inbox/active/completed/archived. project_slug — фильтр по проекту (опционально)."""
-    conn = db()
-    conn.row_factory = sqlite3.Row
-    query = """
-        SELECT t.*, p.slug as project_slug, p.name as project_name, p.color as project_color
-        FROM tasks t
-        LEFT JOIN task_projects p ON t.project_id = p.id
-        WHERE t.status = ?
-    """
-    params = [status]
-    if project_slug:
-        query += " AND p.slug = ?"
-        params.append(project_slug)
-    query += " ORDER BY t.priority ASC, t.due_date ASC, t.created_at DESC"
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def add_task(title: str, description: str = "",
-             status: str = "inbox", priority: int = 3,
-             project_id: int = 0, focus_goal_slug: str = "",
-             due_date: str = "") -> str:
-    """Создать задачу. status: inbox/active/completed/archived. priority: 1-4 (1=высший)."""
-    conn = db()
-    try:
-        # Resolve focus_goal_id from slug if provided
-        focus_goal_id = None
-        if focus_goal_slug:
-            row = conn.execute("SELECT id FROM focus_goals WHERE slug = ?", (focus_goal_slug,)).fetchone()
-            if row:
-                focus_goal_id = row["id"]
-
-        conn.execute(
-            """INSERT INTO tasks (title, description, status, priority, project_id, focus_goal_id, due_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (title, description, status, priority, project_id or None, focus_goal_id, due_date or None)
-        )
-        conn.commit()
-        task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        return json.dumps({"success": True, "task_id": task_id}, ensure_ascii=False)
-    finally:
-        conn.close()
-
-
-@mcp.tool()
-def complete_task(task_id: int) -> str:
-    """Отметить задачу выполненной."""
-    conn = db()
-    cur = conn.execute(
-        "UPDATE tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (task_id,)
-    )
-    conn.commit()
-    conn.close()
-    if cur.rowcount == 0:
-        return json.dumps({"error": f"Задача #{task_id} не найдена"}, ensure_ascii=False)
-    return json.dumps({"success": True, "task_id": task_id, "status": "completed"}, ensure_ascii=False)
-
+# ── ЗДОРОВЬЕ ──────────────────────────────────────────────
 
 # ── ЗДОРОВЬЕ ──────────────────────────────────────────────
 
