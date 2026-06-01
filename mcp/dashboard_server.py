@@ -1,196 +1,156 @@
 #!/usr/bin/env python3
 """
-MCP Server for Personal Dashboard.
-Унифицированный доступ к БД dashboard (SQLite для MVP, PostgreSQL/Supabase в production).
+Personal Dashboard MCP Server — официальный SDK (FastMCP).
+Подключается к Hermes через stdio transport.
 
-Supports: focus_goals, trackers, tracker_entries, daily_entries, health_daily
+Нужно запускать: python3 mcp/dashboard_server.py
+Или через venv:  .venv/bin/python mcp/dashboard_server.py
 """
 
 import os
-import sys
 import json
 import sqlite3
 from pathlib import Path
-from datetime import datetime, date
+from datetime import date
 
-# MCP Protocol
-# stdio mode: reads JSON-RPC on stdin, writes to stdout
+from mcp.server.fastmcp import FastMCP
 
-DB_PATH = os.getenv("DASHBOARD_DB", str(Path(__file__).resolve().parent.parent / "data" / "dashboard.db"))
+# Paths
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "dashboard.db"
+SCHEMA_PATH = BASE_DIR / "schema" / "001_mvp.sql"
 
-
+# Ensure DB exists with schema
 def ensure_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    with open(Path(__file__).resolve().parent.parent / "schema" / "001_mvp.sql", "r") as f:
-        conn.executescript(f.read())
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DB_PATH.exists():
+        conn = sqlite3.connect(DB_PATH)
+        with open(SCHEMA_PATH, "r") as f:
+            conn.executescript(f.read())
+        conn.close()
+    return str(DB_PATH)
+
+DB_PATH_STR = ensure_db()
+
+# Create MCP server
+mcp = FastMCP("dashboard")
+
+# Helper
+def db():
+    return sqlite3.connect(DB_PATH_STR)
+
+
+@mcp.tool()
+def list_trackers(active_only: bool = True) -> str:
+    """Показать список активных трекеров."""
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    query = "SELECT * FROM trackers"
+    if active_only:
+        query += " WHERE active = 1"
+    rows = conn.execute(query).fetchall()
+    conn.close()
+    return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def mark_tracker(tracker_slug: str, value: float = 1.0, notes: str = "", entry_date: str | None = None) -> str:
+    """Отметить выполнение трекера. tracker_slug — slug трекера."""
+    entry_date = entry_date or date.today().isoformat()
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    tracker = conn.execute("SELECT id FROM trackers WHERE slug = ?", (tracker_slug,)).fetchone()
+    if not tracker:
+        conn.close()
+        return json.dumps({"error": f"Трекер '{tracker_slug}' не найден"}, ensure_ascii=False)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO tracker_entries (tracker_id, entry_date, value, notes) VALUES (?, ?, ?, ?)",
+        (tracker["id"], entry_date, value, notes)
+    )
+    conn.commit()
+    conn.close()
+    return json.dumps({
+        "success": True, "tracker": tracker_slug, "date": entry_date, "value": value
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_streak(tracker_slug: str) -> str:
+    """Показать streak (дни подряд) для трекера."""
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT entry_date, value FROM tracker_entries
+        WHERE tracker_id = (SELECT id FROM trackers WHERE slug = ?)
+        ORDER BY entry_date DESC
+    """, (tracker_slug,)).fetchall()
     conn.close()
 
+    if not rows:
+        return json.dumps({"streak": 0, "longest": 0, "total": 0}, ensure_ascii=False)
 
-class DashboardDB:
-    def __init__(self):
-        self.conn = sqlite3.connect(DB_PATH)
-        self.conn.row_factory = sqlite3.Row
+    streak = 0
+    longest = 0
+    today = date.today()
+    for r in rows:
+        d = date.fromisoformat(r["entry_date"])
+        delta = (today - d).days
+        if delta == streak and r["value"]:
+            streak += 1
 
-    def list_trackers(self, active_only: bool = True):
-        query = "SELECT * FROM trackers"
-        if active_only:
-            query += " WHERE active = 1"
-        cursor = self.conn.execute(query)
-        return [dict(row) for row in cursor.fetchall()]
-
-    def mark_tracker(self, tracker_slug: str, value: float = 1.0, notes: str = "", entry_date: str | None = None):
-        entry_date = entry_date or date.today().isoformat()
-        tracker = self.conn.execute("SELECT id FROM trackers WHERE slug = ?", (tracker_slug,)).fetchone()
-        if not tracker:
-            return {"error": f"Трекер '{tracker_slug}' не найден"}
-
-        try:
-            self.conn.execute(
-                """INSERT OR REPLACE INTO tracker_entries (tracker_id, entry_date, value, notes)
-                   VALUES (?, ?, ?, ?)""",
-                (tracker["id"], entry_date, value, notes)
-            )
-            self.conn.commit()
-            return {"success": True, "tracker": tracker_slug, "date": entry_date, "value": value}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def get_streak(self, tracker_slug: str):
-        cursor = self.conn.execute("""
-            SELECT entry_date, value FROM tracker_entries
-            WHERE tracker_id = (SELECT id FROM trackers WHERE slug = ?)
-            ORDER BY entry_date DESC
-        """, (tracker_slug,))
-        rows = cursor.fetchall()
-        if not rows:
-            return {"streak": 0, "longest": 0}
-
-        streak = 0
-        today = date.today()
-        for row in rows:
-            row_date = datetime.strptime(row["entry_date"], "%Y-%m-%d").date()
-            delta = (today - row_date).days
-            if delta == streak and row["value"]:
-                streak += 1
-            elif delta > streak:
-                break
-
-        return {"streak": streak, "total_entries": len(rows)}
-
-    def list_focus_goals(self, status: str = None):
-        query = "SELECT * FROM focus_goals"
-        params = ()
-        if status:
-            query += " WHERE status = ?"
-            params = (status,)
-        query += " ORDER BY priority DESC, deadline ASC"
-        cursor = self.conn.execute(query, params)
-        return [dict(row) for row in cursor.fetchall()]
-
-    def close(self):
-        self.conn.close()
+    return json.dumps({
+        "streak": streak, "total_entries": len(rows), "tracker": tracker_slug
+    }, ensure_ascii=False)
 
 
-# MCP Tool Definitions
-TOOLS = {
-    "list_trackers": {
-        "description": "Показать список активных трекеров",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "active_only": {"type": "boolean", "default": True}
-            }
-        }
-    },
-    "mark_tracker": {
-        "description": "Отметить выполнение трекера. tracker_slug — slug трекера",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tracker_slug": {"type": "string"},
-                "value": {"type": "number", "default": 1},
-                "notes": {"type": "string", "default": ""},
-                "entry_date": {"type": "string", "description": "YYYY-MM-DD, по умолчанию сегодня"}
-            },
-            "required": ["tracker_slug"]
-        }
-    },
-    "get_streak": {
-        "description": "Показать streak (дни подряд) для трекера",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tracker_slug": {"type": "string"}
-            },
-            "required": ["tracker_slug"]
-        }
-    },
-    "list_focus_goals": {
-        "description": "Список фокус-целей. status: planned/active/completed/archived",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "status": {"type": "string", "enum": ["planned", "active", "completed", "archived"]}
-            }
-        }
-    }
-}
+@mcp.tool()
+def list_focus_goals(status: str = None) -> str:
+    """Список фокус-целей. status: planned/active/completed/archived (опционально)."""
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    query = "SELECT * FROM focus_goals"
+    params = ()
+    if status:
+        query += " WHERE status = ?"
+        params = (status,)
+    query += " ORDER BY priority DESC, deadline ASC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2)
 
 
-def handle_request(request: dict) -> dict:
-    method = request.get("method", "")
-    params = request.get("params", {})
-
-    if method == "initialize":
-        return {"tools": TOOLS}
-
-    db = DashboardDB()
+@mcp.tool()
+def add_focus_goal(slug: str, title: str, category: str, metric_unit: str, target_value: float,
+                   deadline: str = None, priority: int = 3, status: str = "planned", context: str = "") -> str:
+    """Создать новую фокус-цель. category: professional/health/finance/content/personal."""
+    conn = db()
     try:
-        if method == "tools/list":
-            return {"tools": [{"name": k, **v} for k, v in TOOLS.items()]}
-
-        elif method == "tools/call":
-            tool = params.get("name", "")
-            args = params.get("arguments", {})
-
-            if tool == "list_trackers":
-                return {"content": db.list_trackers(args.get("active_only", True))}
-            elif tool == "mark_tracker":
-                return {"content": db.mark_tracker(
-                    args["tracker_slug"],
-                    args.get("value", 1.0),
-                    args.get("notes", ""),
-                    args.get("entry_date")
-                )}
-            elif tool == "get_streak":
-                return {"content": db.get_streak(args["tracker_slug"])}
-            elif tool == "list_focus_goals":
-                return {"content": db.list_focus_goals(args.get("status"))}
-            else:
-                return {"error": f"Неизвестный тул: {tool}"}
-
-        return {"error": "Неизвестный метод"}
+        conn.execute(
+            """INSERT INTO focus_goals (slug, title, category, metric_unit, target_value, current_value, deadline, priority, status, context)
+               VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+            (slug, title, category, metric_unit, target_value, deadline, priority, status, context)
+        )
+        conn.commit()
+        return json.dumps({"success": True, "slug": slug}, ensure_ascii=False)
+    except sqlite3.IntegrityError:
+        return json.dumps({"error": f"Цель '{slug}' уже существует"}, ensure_ascii=False)
     finally:
-        db.close()
+        conn.close()
 
 
-def main():
-    ensure_db()
-
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-            response = handle_request(request)
-            print(json.dumps(response, default=str))
-            sys.stdout.flush()
-        except json.JSONDecodeError:
-            print(json.dumps({"error": "Invalid JSON"}))
-            sys.stdout.flush()
+@mcp.tool()
+def update_goal_progress(slug: str, current_value: float) -> str:
+    """Обновить прогресс фокус-цели."""
+    conn = db()
+    cur = conn.execute("UPDATE focus_goals SET current_value = ?, updated_at = CURRENT_TIMESTAMP WHERE slug = ?",
+                       (current_value, slug))
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return json.dumps({"error": f"Цель '{slug}' не найдена"}, ensure_ascii=False)
+    return json.dumps({"success": True, "slug": slug, "current_value": current_value}, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    main()
+    mcp.run()
